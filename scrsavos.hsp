@@ -1,0 +1,355 @@
+#packopt name "scrsavos"     ;実行ファイル名
+#packopt type 2                 ;スクリーンセーバー
+
+// HSP3でのウィンドウ列挙（ウィンドウハンドル）
+// 参考: ちょくとのページ
+// http://chokuto.ifdef.jp/urawaza/mcn/vc_enumwnd2.html
+// VirtualProtect関数ではなくVirtualAlloc関数使用
+// 一部環境でsdim等で確保した領域をVirtualProtect関数で実行属性を付加しても動作しないため
+// （原因はよくわからん）
+#include "kernel32.as"
+#include "user32.as"
+#module
+#deffunc GetWindowList var list, int _max
+	if _max == 0 : max = 4096 : else : max = _max
+	VirtualAlloc 0, 12*4, 0x2000/*MEM_RESERVE*/, 0x40/*PAGE_EXECUTE_READWRITE*/
+	VirtualAlloc stat, 12*4, 0x1000/*MEM_COMMIT*/, 0x40/*PAGE_EXECUTE_READWRITE*/
+	pbm = stat
+	dupptr bm, pbm, 12*4, 4
+	bm.0 = $0824448b, $8b08488b, $ca3b0450, $c033057c, $8b0008c2, $748b5610
+	bm.6 = $34890824, $08488b8a, $48895e41, $0001b808, $08c20000, $00000000
+	dim list, max
+	ENUMWND_DATA = varptr(list), max, 0
+	EnumWindows pbm, varptr(ENUMWND_DATA)
+	dim bm
+	VirtualFree pbm, 12*4, 0x4000 /*MEM_DECOMMIT*/
+	VirtualFree pbm, 0, 0x8000 /*MEM_RELEASE*/
+return
+#global
+
+#module
+	#uselib "user32.dll"
+		#cfunc GetWindowLong "GetWindowLongA" sptr, sptr
+		#cfunc GetWindowThreadProcessID "GetWindowThreadProcessId" sptr, sptr
+	#uselib "kernel32.dll"
+		#cfunc OpenProcess "OpenProcess" sptr, sptr, sptr
+		#func CloseHandle "CloseHandle" sptr
+	#uselib "psapi.dll"
+		#func GetModuleFileNameEx "GetModuleFileNameExA" sptr, sptr, sptr, sptr
+	#deffunc GetProcessName int _hwnd_, var pName
+		dim ret
+		sdim pName, 256
+		sdim FilePath, 1024
+		hMod = GetWindowLong(_hwnd_, 0xFFFFFFFA)
+		thID = GetWindowThreadProcessId(_hwnd_, varptr(PId))
+		hProcess = OpenProcess(0x001F0FFF, 1, PId)
+		if hProcess != 0 {
+			GetModuleFileNameEx hProcess, hMod, varptr(FilePath), 1024		
+			len = stat
+			if len = 0 : ret = -1
+		} else {
+			ret = -1
+		}
+		CloseHandle hProcess
+		pName = getpath(FilePath, 8)
+	return ret
+#global
+
+#module "topmostmod"
+#include "kernel32.as"
+#include "user32.as"
+
+#uselib "kernel32.dll"
+#func QueryFullProcessImageName "QueryFullProcessImageNameA" int, int, int, int
+#uselib "psapi.dll"
+#func EnumProcessModules "EnumProcessModules" int, int, int, int
+#func GetModuleFileNameEx "GetModuleFileNameExA" int, int, int, int
+#define PROCESS_VM_READ				0x10
+#define PROCESS_QUERY_INFORMATION	0x400
+#define PROCESS_NAME_NATIVE 0x00000001
+#define GWL_EXSTYLE 0xFFFFFFEC
+#define WS_EX_TOPMOST 0x00000008
+#define GW_HWNDFIRST 0
+#define GW_HWNDNEXT  2
+
+// Vista以降か調査
+#defcfunc isVista local lpVersionInfo
+	dim lpVersionInfo,37
+	lpVersionInfo(0) = 148
+	GetVersionExA varptr(lpVersionInfo)
+	return(6 <= lpVersionInfo(1))
+
+// ハンドル から ファイルパス を取得
+#defcfunc getProcessPath int handle,local pid,local hsnap,local hprocess,local hmod,local nneed,local out
+	sdim out, 260
+	GetWindowThreadProcessId handle, varptr(pid)
+	OpenProcess PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid
+	hprocess = stat
+	if(hprocess!=0){
+		if(isVista()) {
+			// Vista以降の環境
+			size = 260
+			QueryFullProcessImageName hprocess, 0, varptr(out), varptr(size)
+		}else {
+			// XP以前の環境
+			hmod  = 0:nneed = 0
+			EnumProcessModules hprocess, varptr(hmod), 4, varptr(nneed)
+			if(stat!=0){
+				GetModuleFileNameEx hprocess, hmod, varptr(out), 260
+			}
+		}
+		CloseHandle hprocess
+	}
+	return(out)
+
+// 全てのトップレベルウィンドウのハンドルのリストを取得
+#deffunc getHwndList array hwndarray,local prm
+	dim codeenumwnd, 10
+	codeenumwnd( 0) = $0824448b, $3b08488b, $067c0448, $08488941, $108b0eeb, $24748b56
+	codeenumwnd( 6) = $8a348908, $5e0840ff, $c240c033, $00000008
+	VirtualProtect varptr(codeenumwnd), 40, $40, AZSD
+	prm = 0, 0, 0
+	EnumWindows varptr(codeenumwnd), varptr(prm)
+	dim hwndarray, prm(2)
+	prm = varptr(hwndarray), prm(2), 0
+	EnumWindows varptr(codeenumwnd), varptr(prm)
+	return(hwndarray)
+
+// 文字列の語尾が一致しているかどうか
+#defcfunc isEndsWith str target,str suffix,local x
+	if(strlen(target) < strlen(suffix)) {
+		return(0)
+	}
+	x = target
+	return(strmid(x, strlen(target) - strlen(suffix), strlen(suffix)) == suffix)
+
+// ハンドルが常に最前面表示されているかどうか
+#defcfunc isTopMost int handle
+	GetWindowLongA handle, GWL_EXSTYLE
+	return((stat & WS_EX_TOPMOST) != 0)
+
+// ハンドルが可視かどうか
+#defcfunc isVisble int handle
+	IsWindowVisible handle
+	return(stat != 0)
+
+// 指定した実行ファイルのハンドルのリストを取得
+#deffunc getHwndListByPath array list, str path, local hwndarray, local buff, local len
+	getHwndList hwndarray
+	len = 0
+	dim buff, length(hwndarray)
+	repeat length(hwndarray)
+		if isVisble(hwndarray(cnt)) {
+			if isEndsWith(getProcessPath(hwndarray(cnt)), path) {
+				buff(len) = hwndarray(cnt)
+				len++
+			}
+		}
+	loop
+	dim list, len
+	memcpy list, buff, 4 * len
+	return
+
+// 指定したハンドルより上のハンドルのリストを取得
+#deffunc getPrevHwndList array list, int handle, local buff, local len, local x
+	GetWindow handle, GW_HWNDFIRST
+	x = stat
+	dim buff, 512
+	len = 0
+	repeat
+		GetWindow x, GW_HWNDNEXT
+		if(stat == handle)||(stat == x) {
+			break
+		}
+		x = stat
+		if(isVisble(x)) {
+			buff(len) = x
+			len++
+		}
+	loop
+	dim list, len
+	memcpy list, buff, 4 * len	
+	return
+
+// 指定したハンドルのバウンディングボックスを取得する
+#deffunc getBBList array list, array rect
+	dim rect, 4, length(list)
+	repeat length(list)
+		GetWindowRect list(cnt), varptr(rect(0, cnt)) ;min_x,min_y,max_x,max_y
+	loop
+	return
+
+#define min_x 0
+#define min_y 1
+#define max_x 2
+#define max_y 3
+
+// バウンディングボックスと点との当たり判定
+#defcfunc isContains int A, int x, int y,local box
+	dupptr box, A, 4 * 4, vartype("int")
+	return((box.min_x < x) & (x < box.max_x) & (box.min_y < y) & (y < box.max_y))
+
+// バウンディングボックス同士の当たり判定
+#defcfunc isIntersectBB int A, int B,local box1,local box2
+	dupptr box1, A, 4 * 4, vartype("int")
+	dupptr box2, B, 4 * 4, vartype("int")
+	      if(box1.min_x >= box2.max_x) { return(0)
+	}else:if(box1.max_x <= box2.min_x) { return(0)
+	}else:if(box1.min_y >= box2.max_y) { return(0)
+	}else:if(box1.max_y <= box2.min_y) { return(0)
+	}else { return(1) }
+	
+// 指定したハンドルが、他のハンドルとぶつかっているかどうか調べる
+#deffunc isHitHandle array list, int handle,local MYBB,local TARGETBB,local ishittt
+	dim MYBB, 4
+	GetWindowRect handle, varptr(MYBB)
+	getBBList list, TARGETBB
+	ishittt = 0
+	repeat length(list)
+		ishittt = isIntersectBB(varptr(MYBB), varptr(TARGETBB(0, cnt)))
+		if(ishittt) {
+			break
+		}
+	loop
+	return(ishittt)
+
+// 指定したファイルのソフトの画面がほかのウィンドウに重なっていないか調べる
+#defcfunc isKasanatteinai str path,local list,local prevlist,local kasanatteinai
+	getHwndListByPath list, path
+	kasanatteinai = 0
+	repeat length(list)
+		getPrevHwndList prevlist, list(cnt)
+		isHitHandle prevlist, list(cnt)
+		if(stat == 0) {
+			kasanatteinai = 1
+			break
+		}
+	loop
+	return(kasanatteinai)
+
+#global
+
+#module
+#uselib "user32.dll"
+#cfunc FindWindow "FindWindowA" int,str
+#func MoveWindowAPI "MoveWindow" int,int,int,int,int,int
+#func GetWindowRect "GetWindowRect" int,var
+
+#deffunc MoveWindowx str TitleName,int Px,int Py
+	Thwnd = FindWindow(,TitleName) : if Thwnd = 0 : return 1
+	dim rect,4 : GetWindowRect Thwnd,rect : if stat = 0 : return 2
+	MoveWindowAPI Thwnd,Px,Py,rect(2)-rect(0),rect(3)-rect(1),1 : if stat = 0 : return 3
+	return 0
+#deffunc MoveWindowx2 int handleps,int Px,int Py
+	Thwnd = handleps : if Thwnd = 0 : return 1
+	dim rect,4 : GetWindowRect Thwnd,rect : if stat = 0 : return 2
+	MoveWindowAPI Thwnd,Px,Py,rect(2)-rect(0),rect(3)-rect(1),1 : if stat = 0 : return 3
+	return 0
+#global
+	#module
+	#uselib "kernel32.dll"
+	#cfunc CreateProcess "CreateProcessA" int,sptr,int,int,int,int,int,int,var,var
+	#cfunc WaitForSingleObject "WaitForSingleObject" int,int
+	#cfunc GetEnvironmentVariable "GetEnvironmentVariableA" var,var,int
+	#cfunc CreatePipe "CreatePipe" var,var,var,int
+	#cfunc CloseHandle "CloseHandle" int
+	#cfunc PeekNamedPipe "PeekNamedPipe" int,int,int,int,int,int
+	#cfunc ReadFile "ReadFile" int,var,int,var,int
+	#define SW_HIDE	0
+	#define SW_SHOW	5
+	#deffunc consexec var prm1,str prm2
+	dosexcmd = prm2 : if strlen(dosexcmd)==0 : return -1
+	#define MAX_PATH	260
+	sdim cp,MAX_PATH+2
+	ev="Comspec"	
+	ret=GetEnvironmentVariable(ev,cp,MAX_PATH)
+	if ret==0 : return -1
+	filename=cp+" /c "+dosexcmd
+	#const MAX_BUF_SIZE	1024*1024
+	sdim szBuf,MAX_BUF_SIZE
+
+	sa=12,0,1 : ret=CreatePipe(hRead,hWrite,sa,MAX_BUF_SIZE)
+	;***** 子プロセスを作成 *****
+	#define STARTF_USESHOWWINDOW	1
+	#define STARTF_USESTDHANDLES	$00000100
+
+	dim lpsiStartInfo,17	;STARTUPINFO構造体
+	dim lppiProcInfo,4	;PROCESS_INFOMATION構造体
+	lpsiStartInfo(0)  = 68
+	lpsiStartInfo(11) = STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW
+	lpsiStartInfo(12) = SW_HIDE
+	lpsiStartInfo(15) = hWrite
+	ret=CreateProcess(0,filename,0,0,1,0,0,0,lpsiStartInfo,lppiProcInfo)
+	if ret==0 : end
+
+
+	hprocess=lppiProcInfo(0)
+	ret=WaitForSingleObject(hprocess,$ffffffff)
+	ret=CloseHandle(hWrite)
+	rcvbuf=""	;Buffer Size HSP側で自動確保
+	repeat
+		await 10
+		;***** 標準出力パイプの内容を調べる *****
+		ret=PeekNamedPipe(hRead,0,0,0,dwStdOut,0)
+		ret=ReadFile(hRead,szBuf,4096,dwRead, 0)
+		if dwRead<4096 : memcpy szBuf, szBuf, dwRead, 0, 0 : poke szBuf, dwRead : rcvbuf+=szBuf : break
+		if dwRead==0 : break
+		rcvbuf+=szBuf
+	loop
+	prm1=rcvbuf
+	ret=CloseHandle(hRead)
+	sdim szBuf,0 : sdim cp,0 : sdim rcvbuf,0
+	return 0
+	#global
+    randomize
+    para = dir_cmdline          ;パラメータ取得
+    para = strmid(para, 0, 2)
+    if para = "/p" | para = "/P" : goto *preview    ;プレビュー
+    if para = "/s" | para = "/S" : goto *ssaver         ;フルスクリーン
+    if para = "/c" | para = "/C" : goto *config         ;コンフィグ
+    dialog "無効なオプションです。" + "[" + para + "]"
+    end
+*ssaver
+*config
+end
+*preview
+    win_x = ginfo_winx          ;ウィンドウサイズ(幅)
+    win_y = ginfo_winy          ;ウィンドウサイズ(高さ)
+    bgscr 0,win_x,win_y,0,0,0
+    //exec dir_cur+"\\valivistadev0.01\\"+"\\BoxedWine.exe"
+    exec dir_cur+"\\valivistadev0.01\\"+"\\winedesktopexectest1.bat "+str(win_x)+"x"+str(win_y)+" "
+hParent=hwnd
+repeat
+GetWindowList list, 4096
+repeat varsize(list)/4
+sdim classname,256
+GetClassName list(cnt),varptr(classname),256
+//if strmid(classname,0,9)="WIN16119F"{
+sdim classname2,256
+//GetModuleFileNamexxx list(cnt),classname2,256
+classname2=getProcessPath(list(cnt))
+	if classname2=dir_cur+"\\valivistadev0.01\\"+"BoxedWine.exe" {
+	SetParent list(cnt),hParent
+		//if ginfo(12)<ginfo(20) or ginfo(13)<ginfo(21){
+			dim rect, 4
+			dim rect2, 4
+			GetWindowRect list(cnt), varptr(rect)
+			GetClientRect list(cnt), varptr(rect2)
+			//mes "座標("+rect(0)+","+rect(1)+")"
+			sizex = rect(2) - rect(0)
+			sizey = rect(3) - rect(1)
+			sizexc = rect2(2) - rect2(0)
+			sizeyc = rect2(3) - rect2(1)
+			//MoveWindowx2 hChild,-((sizex-sizexc)/2),-27//((sizey-sizeyc)//+((sizex-sizexc)/2))
+			MoveWindowx2 list(cnt),-((sizex-sizexc)/2),-((sizey-sizeyc)-((sizex-sizexc)/2))//((sizey-sizeyc)//+((sizex-sizexc)/2))
+			//(sizex-sizexc)/2
+			//break
+	}
+loop
+	//if classname2=dir_cur+"\\valivistadev0.01\\"+"BoxedWine.exe" {break}
+await
+loop
+stop
+
+*test
+dialog
